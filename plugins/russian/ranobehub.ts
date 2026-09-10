@@ -17,7 +17,7 @@ const statusKey: Record<number, string> = {
 class RNBH implements Plugin.PluginBase {
   id = 'RNBH.org';
   name = 'RanobeHub';
-  version = '2.0.0';
+  version = '2.0.1';
   site = 'https://ranobehub.org';
   icon = 'src/ru/ranobehub/icon.png';
 
@@ -37,15 +37,17 @@ class RNBH implements Plugin.PluginBase {
     filters?.country?.value?.forEach(country =>
       params.append('country', country),
     );
-    filters?.tags?.value?.include?.forEach(tag => params.append('tag', tag));
-    filters?.events?.value?.include?.forEach(event =>
-      params.append('event', event),
-    );
+    filters?.tags?.value?.forEach(tag => params.append('tag', tag));
+    filters?.events?.value?.forEach(event => params.append('event', event));
     if (filters?.status?.value) params.append('status', filters.status.value);
 
     const result: CatalogResponse = await fetchApi(
       `${this.site}/api/catalog?${params.toString()}`,
     ).then(res => res.json());
+
+    // The endpoint answers errors with {error: ...} instead of a list, so a
+    // missing items array means "nothing to show" rather than a crash.
+    if (!Array.isArray(result?.items)) return [];
 
     return result.items.map(novel => ({
       name: novel.title || novel.originalTitle,
@@ -194,7 +196,7 @@ class RNBH implements Plugin.PluginBase {
     },
     events: {
       label: 'События',
-      value: { include: [], exclude: [] },
+      value: [],
       options: [
         { label: 'Главный герой — мужчина', value: '39' },
         { label: 'Главный герой — женщина', value: '63' },
@@ -287,9 +289,9 @@ class RNBH implements Plugin.PluginBase {
         { label: 'Готовка', value: '193' },
         { label: 'Смерть близких', value: '361' },
         { label: 'Трагическое прошлое', value: '164' },
+        { label: 'Королевства', value: '141' },
         { label: 'Перерождение в ином мире', value: '755' },
         { label: 'Цундэрэ', value: '445' },
-        { label: 'Королевства', value: '141' },
         { label: 'Мрачный мир', value: '1083' },
         { label: 'Дружба', value: '97' },
         { label: 'Верные подчиненные', value: '225' },
@@ -321,8 +323,8 @@ class RNBH implements Plugin.PluginBase {
         { label: 'Кругосветное путешествие', value: '257' },
         { label: 'Военные', value: '1101' },
         { label: 'Социальная иерархия на основе силы', value: '137' },
-        { label: 'Адаптация в радиопостановку', value: '522' },
         { label: 'ЛитРПГ', value: '977' },
+        { label: 'Адаптация в радиопостановку', value: '522' },
         { label: 'Друзья детства', value: '170' },
         { label: 'Постапокалиптика', value: '60' },
         { label: 'Бесстыдный главный герой', value: '256' },
@@ -460,9 +462,9 @@ class RNBH implements Plugin.PluginBase {
         { label: 'Прагматичный главный герой', value: '536' },
         { label: 'Проклятия', value: '48' },
         { label: 'Секретные организации', value: '331' },
+        { label: 'Система', value: '1113' },
         { label: 'Силы, связанные с глазами', value: '386' },
         { label: 'Сироты', value: '214' },
-        { label: 'Система', value: '1113' },
         { label: 'Стратег', value: '425' },
         { label: 'Убийства', value: '84' },
         { label: 'Главный герой влюбляется первым', value: '655' },
@@ -474,16 +476,16 @@ class RNBH implements Plugin.PluginBase {
         { label: 'Ангелы', value: '218' },
         { label: 'Долгая разлука', value: '200' },
         { label: 'Древние времена', value: '102' },
+        { label: 'Души', value: '136' },
         { label: 'Застенчивые персонажи', value: '443' },
         { label: 'Мифические звери', value: '418' },
+        { label: 'Разумные предметы', value: '174' },
         { label: 'Рассказ', value: '61' },
         { label: 'Слабый главный герой', value: '188' },
         { label: 'Создание артефактов', value: '292' },
         { label: '[Награжденная работа]', value: '611' },
         { label: 'Главный герой — собиратель гарема', value: '439' },
-        { label: 'Души', value: '136' },
         { label: 'Развитие отношений', value: '690' },
-        { label: 'Разумные предметы', value: '174' },
         { label: 'Апатичный протагонист', value: '29' },
         { label: 'Мистический ореол вокруг семьи', value: '409' },
         { label: 'Наследование', value: '372' },
@@ -869,6 +871,7 @@ class RNBH implements Plugin.PluginBase {
         { label: 'Пайзури', value: '630' },
         { label: 'Персонаж использует щит', value: '631' },
         { label: 'Притворная пара', value: '600' },
+        { label: 'Сильный главный герой', value: '944' },
         { label: 'Совместное владение телом', value: '814' },
         { label: 'Студенческий совет', value: '490' },
         { label: 'Террористы', value: '515' },
@@ -902,7 +905,6 @@ class RNBH implements Plugin.PluginBase {
           value: '732',
         },
         { label: 'Плейбои', value: '795' },
-        { label: 'Сильный главный герой', value: '944' },
         { label: 'Скульпторы', value: '366' },
         { label: 'Супружеская измена', value: '866' },
         { label: 'Уродливый главный герой', value: '803' },
@@ -1053,11 +1055,11 @@ class RNBH implements Plugin.PluginBase {
         { label: 'Шизофрения', value: '1053' },
         { label: 'Шикигами', value: '543' },
       ],
-      type: FilterTypes.ExcludableCheckboxGroup,
+      type: FilterTypes.CheckboxGroup,
     },
     tags: {
       label: 'Жанры',
-      value: { include: [], exclude: [] },
+      value: [],
       options: [
         { label: 'Фэнтези', value: '8' },
         { label: 'Романтика', value: '9' },
@@ -1112,7 +1114,7 @@ class RNBH implements Plugin.PluginBase {
         { label: 'Магия', value: '1063' },
         { label: 'Самурайский боевик', value: '1123' },
       ],
-      type: FilterTypes.ExcludableCheckboxGroup,
+      type: FilterTypes.CheckboxGroup,
     },
   } satisfies Filters;
 }

@@ -21,6 +21,10 @@ const REPO_ROOT = path.join(__dirname, '..');
 const MIN_CHAPTER_LENGTH = 200;
 const STEP_TIMEOUT_MS = 30_000;
 const CLOUDFLARE_HEADER_HINTS = ['cf-ray', 'cf-cache-status', 'cf-request-id'];
+// Upper bound on how many options of a single filter the live check probes, so
+// a plugin declaring hundreds of options does not turn into hundreds of
+// requests per CI run.
+const MAX_FILTER_PROBES = 3;
 
 /** @typedef {'PASS' | 'FAIL' | 'INCONCLUSIVE'} StepStatus */
 
@@ -140,20 +144,316 @@ function defaultFilterValues(plugin) {
   );
 }
 
+/** Replace one filter's value, keeping the {value, type} shape plugins read. */
+function withProbedValue(defaults, key, value) {
+  return { ...defaults, [key]: { ...defaults[key], value } };
+}
+
+/** Mirrors the FilterTypes enum in src/types/filters.ts. */
+const FilterTypeName = {
+  Text: 'Text',
+  Picker: 'Picker',
+  Checkbox: 'Checkbox',
+  Switch: 'Switch',
+  ExcludableCheckbox: 'XCheckbox',
+};
+
+/**
+ * Options worth probing for a single filter: declared order, skipping the
+ * filter's own default value (re-testing the default proves nothing) and
+ * capped at MAX_FILTER_PROBES.
+ */
+function probeOptions(filter) {
+  const options = Array.isArray(filter?.options) ? filter.options : [];
+  const isGroup =
+    filter?.type === FilterTypeName.Checkbox ||
+    filter?.type === FilterTypeName.ExcludableCheckbox;
+  return options
+    .filter(option => option && typeof option.value === 'string')
+    .filter(option => option.value !== '')
+    .filter(option => (isGroup ? true : option.value !== filter.value))
+    .slice(0, MAX_FILTER_PROBES);
+}
+
+/** Build the filter value a user would produce by picking one option. */
+function valueForProbe(filter, optionValue) {
+  switch (filter?.type) {
+    case FilterTypeName.Picker:
+    case FilterTypeName.Text:
+      return optionValue;
+    case FilterTypeName.Checkbox:
+      return [optionValue];
+    case FilterTypeName.ExcludableCheckbox:
+      return { include: [optionValue], exclude: [] };
+    case FilterTypeName.Switch:
+      return true;
+    default:
+      return undefined;
+  }
+}
+
+function declaredValueMatchesType(type, value) {
+  switch (type) {
+    case FilterTypeName.Picker:
+    case FilterTypeName.Text:
+      return typeof value === 'string';
+    case FilterTypeName.Switch:
+      return typeof value === 'boolean';
+    case FilterTypeName.Checkbox:
+      return Array.isArray(value) && value.every(v => typeof v === 'string');
+    case FilterTypeName.ExcludableCheckbox:
+      return (
+        value !== null &&
+        typeof value === 'object' &&
+        !Array.isArray(value) &&
+        (value.include === undefined || Array.isArray(value.include)) &&
+        (value.exclude === undefined || Array.isArray(value.exclude))
+      );
+    default:
+      return true;
+  }
+}
+
+function requestSignature(requests) {
+  return [...new Set(requests)].sort().join('\n');
+}
+
+/**
+ * Record every URL the plugin fetches while `run` executes. Plugins reach the
+ * network through @libs/fetch, which calls the global fetch at call time, so
+ * patching globalThis.fetch observes every request without any test double in
+ * the plugin itself.
+ */
+async function withRequestCapture(run) {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = (input, init) => {
+    const url = typeof input === 'string' ? input : input?.url;
+    requests.push(`${init?.method ?? 'GET'} ${url}`);
+    return originalFetch(input, init);
+  };
+  try {
+    return { value: await run(), requests };
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+/**
+ * Offline schema checks on the plugin's declared filters. Runs before any
+ * network call so a broken filter definition is still reported when the target
+ * site is unreachable.
+ */
+function checkFilterSchema(plugin) {
+  const filters = plugin.filters;
+  if (!filters || Object.keys(filters).length === 0) return null;
+  const step = makeStep('filterIntegrity');
+  const problems = [];
+  const notes = [];
+  let optionCount = 0;
+
+  for (const [key, filter] of Object.entries(filters)) {
+    const { type, value, options } = filter ?? {};
+    const needsOptions = [
+      FilterTypeName.Picker,
+      FilterTypeName.Checkbox,
+      FilterTypeName.ExcludableCheckbox,
+    ].includes(type);
+
+    if (needsOptions && (!Array.isArray(options) || options.length === 0)) {
+      problems.push(`"${key}" (${type}) declares no options`);
+      continue;
+    }
+    if (!declaredValueMatchesType(type, value)) {
+      problems.push(
+        `"${key}" (${type}) default value does not match its type: ${JSON.stringify(value)}`,
+      );
+    }
+    if (!Array.isArray(options)) continue;
+
+    const seen = new Set();
+    const duplicates = new Set();
+    for (const option of options) {
+      optionCount += 1;
+      if (
+        typeof option?.label !== 'string' ||
+        option.label.trim() === '' ||
+        // An empty value is legitimate — a Picker's "Any" option is `''`, and
+        // plugins read that as "no filter applied". Only a missing value is a bug.
+        typeof option?.value !== 'string'
+      ) {
+        problems.push(
+          `"${key}" has an option with an empty label or value: ${JSON.stringify(option)}`,
+        );
+        continue;
+      }
+      if (seen.has(option.value)) duplicates.add(option.value);
+      seen.add(option.value);
+    }
+    // A duplicate value is harmless at runtime (the app just shows two identical
+    // checkboxes), so it is reported rather than failed — failing on it would
+    // retroactively break unrelated plugins that already ship one.
+    if (duplicates.size > 0) {
+      notes.push(`"${key}" repeats value(s) ${[...duplicates].join(', ')}`);
+    }
+  }
+
+  const filterCount = Object.keys(filters).length;
+  if (problems.length > 0) {
+    step.status = 'FAIL';
+    step.detail = problems.slice(0, 3).join('; ');
+    return step;
+  }
+  step.status = 'PASS';
+  step.detail = `${filterCount} filters, ${optionCount} options${
+    notes.length > 0 ? ` (${notes.slice(0, 2).join('; ')})` : ''
+  }`;
+  return step;
+}
+
+/**
+ * Exercise the plugin with non-default filter values — the app's filter menu
+ * sends these, but the default-values call in step 1 never does. A filter that
+ * produces the same request as the defaults is silently doing nothing, which is
+ * exactly how an unread `.value.exclude` hides.
+ */
+async function runFilterMatrix(plugin, defaults, defaultRequests) {
+  const filters = plugin.filters;
+  if (!filters || Object.keys(filters).length === 0) return [];
+
+  const matrixStep = makeStep('filterMatrix');
+  const excludeStep = makeStep('filterExcludeHandling');
+  const steps = [matrixStep, excludeStep];
+  const defaultSignature = requestSignature(defaultRequests);
+  const failures = [];
+  const probed = [];
+  let excludeProbes = 0;
+  const excludableKeys = Object.entries(filters)
+    .filter(([, filter]) => filter?.type === FilterTypeName.ExcludableCheckbox)
+    .map(([key]) => key);
+
+  for (const [key, filter] of Object.entries(filters)) {
+    for (const option of probeOptions(filter)) {
+      const probeFilters = withProbedValue(
+        defaults,
+        key,
+        valueForProbe(filter, option.value),
+      );
+      try {
+        const { value: novels, requests } = await withTimeout(
+          withRequestCapture(() =>
+            plugin.popularNovels(1, { filters: probeFilters }),
+          ),
+          STEP_TIMEOUT_MS,
+          `popularNovels(${key}=${option.label})`,
+        );
+        if (!Array.isArray(novels) || novels.length === 0) {
+          failures.push(`"${key}" = "${option.label}" returned no novels`);
+          continue;
+        }
+        if (requestSignature(requests) === defaultSignature) {
+          failures.push(
+            `"${key}" = "${option.label}" sent the same request as the default filters (filter has no effect)`,
+          );
+          continue;
+        }
+        probed.push(`${key}=${option.value}`);
+      } catch (error) {
+        const net = isNetworkOrBlockError(error);
+        if (net.inconclusive) {
+          matrixStep.status = 'INCONCLUSIVE';
+          matrixStep.detail = net.reason || error.message;
+          excludeStep.status = 'INCONCLUSIVE';
+          excludeStep.detail =
+            'Skipped — filter probes could not reach the site';
+          return steps;
+        }
+        failures.push(`"${key}" = "${option.label}" threw: ${error.message}`);
+      }
+    }
+
+    // An ExcludableCheckboxGroup promises the user an exclude toggle. If
+    // excluding changes nothing about the outgoing request, that promise is
+    // broken — either read `.value.exclude` or declare a plain CheckboxGroup.
+    if (!excludableKeys.includes(key)) continue;
+    const option = probeOptions(filter)[0];
+    if (!option) continue;
+    excludeProbes += 1;
+    const excludeOnly = withProbedValue(defaults, key, {
+      include: [],
+      exclude: [option.value],
+    });
+    try {
+      const { requests } = await withTimeout(
+        withRequestCapture(() =>
+          plugin.popularNovels(1, { filters: excludeOnly }),
+        ),
+        STEP_TIMEOUT_MS,
+        `popularNovels(${key} exclude ${option.label})`,
+      );
+      if (requestSignature(requests) === defaultSignature) {
+        failures.push(
+          `"${key}" exclude-only selection sent the same request as the default filters (exclude is read nowhere)`,
+        );
+      }
+    } catch (error) {
+      const net = isNetworkOrBlockError(error);
+      if (net.inconclusive) {
+        excludeStep.status = 'INCONCLUSIVE';
+        excludeStep.detail = net.reason || error.message;
+        return steps;
+      }
+      failures.push(`"${key}" exclude-only selection threw: ${error.message}`);
+    }
+  }
+
+  if (failures.length > 0) {
+    matrixStep.status = 'FAIL';
+    matrixStep.detail = failures.slice(0, 3).join('; ');
+  } else {
+    matrixStep.status = 'PASS';
+    matrixStep.detail = `${probed.length} non-default filter value(s) changed the request`;
+  }
+
+  if (excludableKeys.length === 0) {
+    excludeStep.status = 'PASS';
+    excludeStep.detail = 'No ExcludableCheckboxGroup filters declared';
+  } else if (failures.some(f => f.includes('exclude'))) {
+    excludeStep.status = 'FAIL';
+    excludeStep.detail = failures
+      .filter(f => f.includes('exclude'))
+      .slice(0, 2)
+      .join('; ');
+  } else if (excludeStep.status !== 'INCONCLUSIVE') {
+    excludeStep.status = 'PASS';
+    excludeStep.detail = `${excludeProbes} exclude selection(s) changed the request`;
+  }
+
+  return steps;
+}
+
 async function runChecks(plugin) {
   const steps = [];
   const filters = defaultFilterValues(plugin);
+
+  // 0. Offline filter-schema checks. Before any network call so they still
+  // report when the site is down or blocking the runner.
+  const integrityStep = checkFilterSchema(plugin);
+  if (integrityStep) steps.push(integrityStep);
 
   // 1. popularNovels
   const popularStep = makeStep('popularNovels');
   steps.push(popularStep);
   let popular;
+  let defaultRequests = [];
   try {
-    popular = await withTimeout(
-      plugin.popularNovels(1, { filters }),
+    const captured = await withTimeout(
+      withRequestCapture(() => plugin.popularNovels(1, { filters })),
       STEP_TIMEOUT_MS,
       'popularNovels',
     );
+    popular = captured.value;
+    defaultRequests = captured.requests;
     if (!Array.isArray(popular) || popular.length === 0) {
       popularStep.status = 'FAIL';
       popularStep.detail = 'Returned no novels';
@@ -167,6 +467,11 @@ async function runChecks(plugin) {
     popularStep.detail = net.reason || error.message;
     return steps;
   }
+
+  // 2. Non-default filter values. Runs as soon as the default call succeeded so
+  // a later parseNovel/parseChapter failure cannot hide a filter that is not
+  // wired up.
+  steps.push(...(await runFilterMatrix(plugin, filters, defaultRequests)));
 
   const firstNovel = popular[0];
 
@@ -219,8 +524,30 @@ async function runChecks(plugin) {
         : 'No chapters returned';
       return steps;
     }
+    // cover is required; the other metadata fields are legitimately absent on
+    // many sites, so they are reported but do not fail the check.
+    //
+    // Note: chapter releaseTime is deliberately not asserted. Plugins read dayjs
+    // from the runtime (the app injects its own instance via
+    // src/plugins/pluginManager.ts with localizedFormat already extended), so a
+    // token like 'LLL' is correct in the app even though this harness bundles
+    // its own unconfigured copy of dayjs and therefore sees the literal token.
+    const metadata = ['author', 'genres', 'status', 'summary'];
+    const absent = metadata.filter(field => {
+      const value = novel[field];
+      return typeof value !== 'string' || value.trim() === '';
+    });
+    if (!novel.cover || String(novel.cover).trim() === '') {
+      parseNovelStep.status = 'FAIL';
+      parseNovelStep.detail = 'Missing cover';
+      return steps;
+    }
     parseNovelStep.status = 'PASS';
-    parseNovelStep.detail = `${chapters.length} chapters`;
+    parseNovelStep.detail = `${chapters.length} chapters; cover ✓${
+      absent.length > 0
+        ? `; absent: ${absent.join(', ')}`
+        : '; author/genres/status/summary ✓'
+    }`;
     novel = { ...novel, chapters };
   } catch (error) {
     const net = isNetworkOrBlockError(error);
